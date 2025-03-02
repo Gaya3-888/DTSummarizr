@@ -6,8 +6,10 @@ const router = express.Router();
 // Get all summaries
 router.get("/", async (req, res) => {
   try {
-    const summaries = await Summary.find().populate("callId agentId", "name email 
-transcript");
+    const summaries = await Summary.find()
+  .populate({ path: "callId", select: "transcript" }) 
+  .populate({ path: "agentId", select: "name email" });
+
     res.json(summaries);
   } catch (err) {
     res.status(500).json({ error: err.message });
