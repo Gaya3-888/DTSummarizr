@@ -8,4 +8,3 @@ const CallSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 module.exports = mongoose.model("Call", CallSchema);
-
