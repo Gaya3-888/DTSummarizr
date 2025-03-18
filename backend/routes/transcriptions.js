@@ -1,12 +1,21 @@
 const express = require("express");
-const { getTranscriptions, createTranscription } = require("../controllers/transcriptionController");
+// const { getTranscriptions, createTranscription } = require("../controllers/transcriptionController");
+// const { getTranscription } = require("../controllers/transcriptionController");
 
 const { authenticateUser } = require("../middleware/authMiddleware");
+const { checkTranscriptionStatus } = require("../controllers/transcriptionController");
+const { getTranscriptionText } = require("../controllers/transcriptionController");
 
 const router = express.Router();
 
-router.get("/", authenticateUser, getTranscriptions);
-router.post("/", authenticateUser, createTranscription);
+// Route to check transcription status
+router.get("/transcription-status", checkTranscriptionStatus);
+
+router.get("/transcription-text", getTranscriptionText);
+
+router.get("/:id", authenticateUser);
+    // , getTranscription);
+// router.post("/", authenticateUser, createTranscription);
 
 module.exports = router;
 

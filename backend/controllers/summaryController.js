@@ -1,103 +1,100 @@
-const Summary = require("../models/Summary");
-const Transcription = require("../models/Transcription");
-const { summarizeText } = require("../utils/summaryUtils");
+const { S3Client, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { ChatOpenAI } = require("@langchain/openai");
+const { LLMChain } = require("langchain/chains");
+const { PromptTemplate } = require("@langchain/core/prompts");
+
+const { Readable } = require("stream");
+
+const s3Client = new S3Client({ region: process.env.AWS_REGION });
+const bucket = process.env.S3_BUCKET_NAME;
 
 /**
- * Generates a summary for an existing transcription.
+ * Convert S3 file stream to a string.
  */
-const summarizeTranscription = async (req, res) => {
-    try {
-        const { transcriptionId } = req.body;
+const streamToString = async (stream) => {
+    const chunks = [];
+    for await (const chunk of stream) {
+        chunks.push(chunk);
+    }
+    return Buffer.concat(chunks).toString("utf8");
+};
 
-        // Check if the transcription exists
-        const transcription = await Transcription.findById(transcriptionId);
-        if (!transcription) {
-            return res.status(404).json({ error: "Transcription not found." });
+/**
+ * Fetch transcription from S3.
+ */
+const fetchS3File = async (bucket, key) => {
+    try {
+        console.log("Fetching S3 file with Key:", key); // ✅ Debugging key before fetching
+
+        const command = new GetObjectCommand({ Bucket: bucket, Key: key });
+        const response = await s3Client.send(command);
+        const data = await streamToString(response.Body);
+        const jsonData = JSON.parse(data);
+
+        // Ensure correct data structure
+        if (!jsonData.results || !jsonData.results.transcripts || !jsonData.results.transcripts.length) {
+            throw new Error("Invalid transcription format");
         }
 
-        // Generate summary using OpenAI GPT
-        const summaryResult = await summarizeText(transcription.transcription);
+        return jsonData.results.transcripts.map(t => t.transcript).join(" ");
+    } catch (error) {
+        console.error("❌ S3 Fetch Error:", error);
+        throw new Error("Failed to fetch transcription data");
+    }
+};
 
-        if (!summaryResult || summaryResult.status === "failed") {
-            return res.status(500).json({ error: "Summarization failed.", details: summaryResult.error });
+
+/**
+ * Generate Summary using LangChain.
+ */
+const generateSummary = async (req, res) => {
+    try {
+        const { jobName, length = "regular", complexity = "regular", format = "regular" } = req.body;
+
+        if (!jobName) {
+            return res.status(400).json({ message: "jobName is required" });
         }
 
-        // Save the summary in MongoDB
-        const newSummary = new Summary({
-            transcription: transcriptionId,
-            summaryText: summaryResult.summary,
-            bulletPoints: summaryResult.bulletPoints || [],
-            sentiment: summaryResult.sentiment || "neutral",
-            status: "completed"
-        });
+        // ✅ Use jobName to fetch the file from S3
+        const key = `${jobName}.json`;
+        console.log("Generated S3 Key:", key); // Debug log before calling fetchS3File
 
-        await newSummary.save();
+        const transcription = await fetchS3File(bucket, key);
 
-        return res.status(201).json({
-            message: "Summarization completed successfully.",
-            summary: newSummary
-        });
-
-    } catch (error) {
-        console.error("Error generating summary:", error);
-        return res.status(500).json({ error: "Internal server error." });
-    }
-};
-
-/**
- * Retrieves all summaries from the database.
- */
-const getSummaries = async (req, res) => {
-    try {
-        const summaries = await Summary.find().populate("transcription").sort({ createdAt: -1 });
-        return res.status(200).json(summaries);
-    } catch (error) {
-        console.error("Error fetching summaries:", error);
-        return res.status(500).json({ error: "Internal server error." });
-    }
-};
-
-/**
- * Retrieves a single summary by ID.
- */
-const getSummaryById = async (req, res) => {
-    try {
-        const summary = await Summary.findById(req.params.id).populate("transcription");
-        if (!summary) {
-            return res.status(404).json({ error: "Summary not found." });
+        if (!transcription || !transcription.trim()) {
+            return res.status(400).json({ message: "Empty or invalid transcription data" });
         }
-        return res.status(200).json(summary);
-    } catch (error) {
-        console.error("Error fetching summary:", error);
-        return res.status(500).json({ error: "Internal server error." });
-    }
-};
 
-/**
- * Creates a new summary.
- */
-const createSummary = async (req, res) => {
-    try {
-        const { transcriptionId, summaryText, bulletPoints, sentiment } = req.body;
+        const model = new ChatOpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-        const summary = new Summary({
-            transcription: transcriptionId,
-            summaryText,
-            bulletPoints,
-            sentiment,
-            createdAt: new Date(),
+        const prompt = new PromptTemplate({
+            template: `Summarize the following transcript based on the given preferences:
+            - Length: {length}
+            - Complexity: {complexity}
+            - Format: {format}
+
+            Transcript:
+            {transcript}
+
+            Summary:`,
+            inputVariables: ["length", "complexity", "format", "transcript"],
         });
 
-        await summary.save();
-        res.status(201).json({ message: "Summary created successfully", summary });
+        const chain = new LLMChain({ llm: model, prompt });
+
+        const summary = await chain.call({
+            length,
+            complexity,
+            format,
+            transcript: transcription,
+        });
+
+        res.json({ summary });
+
     } catch (error) {
-        res.status(500).json({ message: "Error creating summary", error });
+        console.error("❌ Summarization Error:", error);
+        res.status(500).json({ error: "Failed to summarize transcription" });
     }
 };
 
-module.exports = {
-    summarizeTranscription,
-    getSummaries,
-    getSummaryById,
-    createSummary
-};
+module.exports = { generateSummary };

@@ -1,156 +1,111 @@
-const Transcription = require("../models/Transcription");
-const { transcribeAudio } = require("../utils/transcribeUtils");
-const multer = require("multer");
-const path = require("path");
-const fs = require("fs");
+const { getSignedUrlForFile } = require("../utils/awsS3Utils");
+const axios = require("axios");
+const { TranscribeClient, GetTranscriptionJobCommand } = require("@aws-sdk/client-transcribe");
+const { generateSummary } = require("../controllers/summaryController"); // Use LangChain summarization
 
-// Configure Multer for file uploads
-const upload = multer({ dest: "uploads/" });
+const transcribeClient = new TranscribeClient({ region: process.env.AWS_REGION });
 
-/**
- * Handles audio file upload and transcription.
- */
-const uploadAudio = async (req, res) => {
+const { saveTranscriptionJob } = require("../utils/transcriptionUtils");
+
+exports.transcribeAudio = async (req, res) => {
     try {
-        if (!req.file) {
-            return res.status(400).json({ error: "No file uploaded." });
+        const { audioUrl, fileId } = req.body;
+        if (!audioUrl || !fileId) {
+            return res.status(400).json({ message: "Audio URL and File ID are required" });
         }
 
-        const filePath = req.file.path; // Path to uploaded file
+        const jobName = `transcription-${Date.now()}`;
 
-        // Transcribe the audio using OpenAI Whisper
-        const transcriptionResult = await transcribeAudio(filePath);
+        // Save the transcription job with a consistent file ID
+        await saveTranscriptionJob(jobName, fileId, audioUrl);
 
-        if (transcriptionResult.status === "failed") {
-            return res.status(500).json({ error: "Transcription failed.", details: transcriptionResult.error });
-        }
-
-        // Save the transcription in MongoDB
-        const newTranscription = new Transcription({
-            audioFile: req.file.filename,
-            transcription: transcriptionResult.transcription,
-            status: "completed"
+        res.status(200).json({
+            message: "Transcription job started",
+            jobName,
+            fileId,
+            s3Url: audioUrl,
         });
-
-        await newTranscription.save();
-
-        // Remove the audio file after processing (optional)
-        fs.unlinkSync(filePath);
-
-        return res.status(201).json({
-            message: "Transcription completed successfully.",
-            transcription: newTranscription
-        });
-
     } catch (error) {
-        console.error("Error processing transcription:", error);
-        return res.status(500).json({ error: "Internal server error." });
+        console.error("Transcription Error:", error);
+        res.status(500).json({ message: "Failed to start transcription", error: error.message });
     }
 };
 
 /**
- * Retrieves all transcriptions from the database.
+ * Fetch Transcribed Text
+ * Retrieves the transcription text from the S3 bucket.
  */
-const getTranscriptions = async (req, res) => {
-    try {
-        const transcriptions = await Transcription.find().sort({ createdAt: -1 });
-        return res.status(200).json(transcriptions);
-    } catch (error) {
-        console.error("Error fetching transcriptions:", error);
-        return res.status(500).json({ error: "Internal server error." });
-    }
-};
+exports.getTranscriptionText = async (req, res) => {
+    const { jobName } = req.query;
 
-/**
- * Retrieves a single transcription by ID.
- */
-const getTranscriptionById = async (req, res) => {
+    if (!jobName) {
+        return res.status(400).json({ message: "Job name is required" });
+    }
+
     try {
-        const transcription = await Transcription.findById(req.params.id);
-        if (!transcription) {
-            return res.status(404).json({ error: "Transcription not found." });
-        }
-        return res.status(200).json(transcription);
+        const fileName = `${jobName}.json`;
+        const signedUrl = await getSignedUrlForFile(fileName);
+        const response = await axios.get(signedUrl);
+
+        const transcriptText = response.data.results.transcripts[0].transcript || "";
+        if (!transcriptText) return res.status(400).json({ message: "No transcription found" });
+
+        res.status(200).json({ jobName, transcriptText });
     } catch (error) {
         console.error("Error fetching transcription:", error);
-        return res.status(500).json({ error: "Internal server error." });
+        res.status(500).json({ message: "Failed to retrieve transcription", error: error.message });
     }
 };
 
 /**
- * Creates a new transcription.
+ * Summarize Transcription (Now uses LangChain)
  */
-const createTranscription = async (req, res) => {
+exports.summarizeTranscription = async (req, res) => {
+    const { jobName, length = "regular", complexity = "regular", format = "regular" } = req.body;
+
+    if (!jobName) {
+        return res.status(400).json({ message: "Job name is required" });
+    }
+
     try {
-        const { audioFile, transcriptionText } = req.body;
+        // Use LangChain-based summarization
+        const summary = await generateSummary({ jobName, length, complexity, format });
 
-        const transcription = new Transcription({
-            audioFile,
-            transcription: transcriptionText,
-            createdAt: new Date(),
+        res.status(200).json({
+            jobName,
+            summary,
         });
-
-        await transcription.save();
-        res.status(201).json({ message: "Transcription created successfully", transcription });
     } catch (error) {
-        res.status(500).json({ message: "Error creating transcription", error });
+        console.error("Error summarizing transcription:", error);
+        res.status(500).json({ message: "Failed to summarize transcription", error: error.message });
     }
 };
 
-module.exports = {
-    upload,
-    uploadAudio,
-    getTranscriptions,
-    getTranscriptionById,
-    createTranscription
+/**
+ * Check Transcription Status
+ */
+exports.checkTranscriptionStatus = async (req, res) => {
+    const { jobName } = req.query;
+
+    if (!jobName) {
+        return res.status(400).json({ message: "Missing jobName parameter" });
+    }
+
+    try {
+        const command = new GetTranscriptionJobCommand({ TranscriptionJobName: jobName });
+        const response = await transcribeClient.send(command);
+
+        if (!response.TranscriptionJob) {
+            return res.status(404).json({ message: "Transcription job not found" });
+        }
+
+        res.status(200).json({
+            jobName,
+            status: response.TranscriptionJob.TranscriptionJobStatus,
+            transcriptUrl: response.TranscriptionJob.Transcript?.TranscriptFileUri || null,
+        });
+    } catch (error) {
+        console.error("❌ Error checking transcription status:", error);
+        res.status(500).json({ message: "Failed to check transcription status" });
+    }
 };
-
-
-// const Transcription = require('../models/Transcription');
-// const { summarizeText } = require("../utils/summaryUtils");
-// const { exec } = require('child_process');
-
-// exports.getTranscriptions = async (req, res) => {
-//     try {
-//         const transcriptions = await Transcription.find().populate('callId');
-//         res.json(transcriptions);
-//     } catch (error) {
-//         res.status(500).json({ message: error.message });
-//     }
-// };
-
-// exports.createTranscription = async (req, res) => {
-//     try {
-//         const { callId, text, confidenceScore } = req.body;
-//         const newTranscription = new Transcription({ callId, text, confidenceScore });
-//         await newTranscription.save();
-//         res.status(201).json(newTranscription);
-//     } catch (error) {
-//         res.status(400).json({ message: error.message });
-//     }
-// };
-
-// // Fix: Ensure function is correctly exported
-// exports.processTranscription = async (filePath) => {
-//     return new Promise((resolve, reject) => {
-//         exec(`whisper ${filePath} --model small`, async (error, stdout) => {
-//             if (error) return reject(error);
-
-//             const transcriptionText = stdout.trim();
-//             console.log("Transcription Output:", transcriptionText);
-
-//             // Generate summary using OpenAI
-//             const summaryText = await summarizeText(transcriptionText);
-
-//             // Save to MongoDB
-//             const newTranscription = new Transcription({
-//                 audioFile: filePath,
-//                 transcription: transcriptionText,
-//                 summary: summaryText,
-//             });
-
-//             await newTranscription.save();
-//             resolve({ transcriptionText, summaryText });
-//         });
-//     });
-// };
