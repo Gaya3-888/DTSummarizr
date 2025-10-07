@@ -201,7 +201,7 @@ Want to contribute? Open an issue or submit a pull request!
 
 ## License
 
-MIT License © 2025 Max Dell-Thibodeau & Friends & Family
+MIT License © 2025 Gaya3 & Friends & Family
 
 ---
 
